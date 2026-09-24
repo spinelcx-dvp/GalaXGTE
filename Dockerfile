@@ -1,7 +1,7 @@
-FROM alpine:latest
+FROM python:3.12-alpine
 
 # نصب ابزارهای لازم
-RUN apk add --no-cache nginx nodejs npm curl unzip jq bash
+RUN apk add --no-cache curl unzip bash
 
 # نصب Xray-core
 RUN mkdir -p /usr/local/share/xray && \
@@ -10,19 +10,13 @@ RUN mkdir -p /usr/local/share/xray && \
     chmod +x /usr/local/share/xray/xray && \
     rm /tmp/xray.zip
 
-# ساخت پوشه‌های لازم
-RUN mkdir -p /etc/nginx/http.d /etc/xray /var/log/nginx /var/run
-
-# کپی فایل‌های پروژه
+# کپی فایل‌ها
 WORKDIR /app
-COPY server.js /app/
+COPY main.py /app/
 COPY start.sh /app/
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY nginx.conf.template /app/
-
 RUN chmod +x /app/start.sh
 
-# پورت پیش‌فرض Railway
+# پورت پیش‌فرض
 EXPOSE 8080
 
 CMD ["/app/start.sh"]
