@@ -1,25 +1,21 @@
 #!/bin/bash
 set -e
 
-# دریافت متغیرها از Railway
 export APP_PORT=${PORT:-8080}
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 export WSPATH=${WSPATH:-/ws}
 export PASS=${PASS:-""}
 export XRAY_PORT=10000
-export PANEL_PORT=3000
 
 echo "=============================================="
-echo "  Starting SpinPanel (Python Edition)"
+echo "  Starting SpinPanel (Transparent WS Proxy)"
 echo "=============================================="
 echo "  Public Port : $APP_PORT"
 echo "  Xray Port   : $XRAY_PORT"
-echo "  Panel Port  : $PANEL_PORT"
 echo "  UUID        : $UUID"
 echo "  WS Path     : $WSPATH"
 echo "=============================================="
 
-# ساخت کانفیگ Xray
 mkdir -p /etc/xray
 cat > /etc/xray/config.json <<EOF
 {
@@ -43,20 +39,16 @@ EOF
 
 echo "[+] Xray config generated."
 
-# اجرای Xray در پس‌زمینه
 /usr/local/share/xray/xray -c /etc/xray/config.json &
 XRAY_PID=$!
 echo "[+] Xray started (PID: $XRAY_PID)"
 
-# انتظار کوتاه برای بالا آمدن Xray
 sleep 2
 
-# بررسی سلامت Xray
 if ! kill -0 $XRAY_PID 2>/dev/null; then
     echo "[!] Xray failed to start!"
     exit 1
 fi
 
-# اجرای پنل پایتونی در foreground
 echo "[+] Starting Python panel on port $APP_PORT..."
 exec python3 /app/main.py
