@@ -10,13 +10,19 @@ RUN mkdir -p /usr/local/share/xray && \
     chmod +x /usr/local/share/xray/xray && \
     rm /tmp/xray.zip
 
+# ساخت پوشه‌های لازم
+RUN mkdir -p /etc/nginx/http.d /etc/xray /var/log/nginx /var/run
+
 # کپی فایل‌های پروژه
 WORKDIR /app
 COPY server.js /app/
 COPY start.sh /app/
+COPY nginx.conf /etc/nginx/nginx.conf
 COPY nginx.conf.template /app/
 
 RUN chmod +x /app/start.sh
 
-# اجرا
+# پورت پیش‌فرض Railway
+EXPOSE 8080
+
 CMD ["/app/start.sh"]
