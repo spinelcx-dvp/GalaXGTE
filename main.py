@@ -2,7 +2,7 @@
 """
 SpinPanel - Python Edition
 پروکسی معکوس + پنل وب برای Xray VLESS WS
-بدون وابستگی به Nginx
+بدون Nginx - فقط کتابخانه استاندارد پایتون
 """
 
 import os
@@ -16,33 +16,35 @@ import socketserver
 from urllib.parse import urlparse
 
 # ============================================
-# تنظیمات از متغیرهای محیطی
+# تنظیمات از متغیرهای محیطی Railway
 # ============================================
-APP_PORT   = int(os.environ.get("PORT", 8080))
-XRAY_PORT  = int(os.environ.get("XRAY_PORT", 10000))
-UUID       = os.environ.get("UUID", "generated-uuid")
-WSPATH     = os.environ.get("WSPATH", "/ws")
-PASS       = os.environ.get("PASS", "")
-DOMAIN     = (
+APP_PORT  = int(os.environ.get("PORT", 8080))
+XRAY_PORT = int(os.environ.get("XRAY_PORT", 10000))
+UUID      = os.environ.get("UUID", "generated-uuid")
+WSPATH    = os.environ.get("WSPATH", "/ws")
+PASS      = os.environ.get("PASS", "")
+DOMAIN    = (
     os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     or os.environ.get("RAILWAY_STATIC_URL")
     or "localhost"
 )
 
-print(f"[Config] APP_PORT={APP_PORT}, XRAY_PORT={XRAY_PORT}")
-print(f"[Config] UUID={UUID}, WSPATH={WSPATH}")
-print(f"[Config] DOMAIN={DOMAIN}")
+print(f"[Config] APP_PORT={APP_PORT}", flush=True)
+print(f"[Config] XRAY_PORT={XRAY_PORT}", flush=True)
+print(f"[Config] UUID={UUID}", flush=True)
+print(f"[Config] WSPATH={WSPATH}", flush=True)
+print(f"[Config] DOMAIN={DOMAIN}", flush=True)
 
 
 # ============================================
-# ابزار: رله دوطرفه TCP (برای WebSocket)
+# رله دوطرفه TCP (قلب WebSocket)
 # ============================================
 def relay(sock_a, sock_b):
-    """داده را بین دو سوکت به صورت دوطرفه منتقل می‌کند."""
+    """انتقال دوطرفه داده بین دو سوکت"""
     sockets = [sock_a, sock_b]
     try:
         while True:
-            readable, _, _ = select.select(sockets, [], [], 60)
+            readable, _, _ = select.select(sockets, [], [], 300)
             if not readable:
                 break
             for s in readable:
@@ -60,83 +62,61 @@ def relay(sock_a, sock_b):
     except Exception:
         pass
     finally:
-        try:
-            sock_a.close()
-        except Exception:
-            pass
-        try:
-            sock_b.close()
-        except Exception:
-            pass
-
-
-def handle_websocket(client_sock, initial_data):
-    """اتصال کلاینت را به Xray (WebSocket) رله می‌کند."""
-    try:
-        upstream = socket.create_connection(("127.0.0.1", XRAY_PORT), timeout=10)
-    except Exception as e:
-        print(f"[WS] Cannot connect to Xray: {e}")
-        client_sock.close()
-        return
-
-    try:
-        upstream.sendall(initial_data)
-    except Exception:
-        client_sock.close()
-        upstream.close()
-        return
-
-    relay(client_sock, upstream)
+        for s in (sock_a, sock_b):
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 # ============================================
-# هندلر HTTP اصلی (پروکسی + پنل)
+# هندلر HTTP اصلی
 # ============================================
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "SpinPanel/1.0"
 
-    # ---- حذف لاگ‌های اضافی ----
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.flush()
 
-    # ---- تشخیص WebSocket ----
+    # ---------- تشخیص WebSocket ----------
     def is_websocket(self):
         upgrade = self.headers.get("Upgrade", "").lower()
         connection = self.headers.get("Connection", "").lower()
         return "websocket" in upgrade and "upgrade" in connection
 
-    # ---- پروکسی به Xray (WebSocket) ----
-    def proxy_to_xray(self):
-        # اگر بدنه‌ای هست، بخوان (برای WS معمولاً نیست)
-        content_length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(content_length) if content_length else b""
-
-        # بازسازی درخواست HTTP برای Xray
-        request_line = f"{self.command} {self.path} {self.request_version}\r\n"
-        headers = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
-        raw_request = (request_line + headers + "\r\n").encode() + body
-
-        # ارسال پاسخ 101 Switching Protocols به کلاینت
-        # (Xray خودش باید این را بدهد، پس اول به Xray وصل می‌شویم و پاسخش را می‌خوانیم)
+    # ---------- پروکسی WebSocket به Xray ----------
+    def proxy_to_xray_ws(self):
         try:
             upstream = socket.create_connection(("127.0.0.1", XRAY_PORT), timeout=10)
         except Exception as e:
             self.send_error(502, f"Bad Gateway: {e}")
             return
 
+        # ساخت درخواست خام HTTP
+        lines = [f"{self.command} {self.path} {self.request_version}"]
+        for k, v in self.headers.items():
+            lines.append(f"{k}: {v}")
+        raw_request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", "ignore")
+
         try:
             upstream.sendall(raw_request)
-            # خواندن پاسخ اولیه از Xray
-            upstream.settimeout(10)
-            response = b""
+        except Exception:
+            upstream.close()
+            self.send_error(502, "Xray write error")
+            return
+
+        # خواندن پاسخ اولیه از Xray (تا انتهای هدرها)
+        upstream.settimeout(10)
+        response = b""
+        try:
             while b"\r\n\r\n" not in response:
                 chunk = upstream.recv(4096)
                 if not chunk:
                     break
                 response += chunk
-        except Exception as e:
-            self.send_error(502, f"Xray error: {e}")
+        except Exception:
             upstream.close()
             return
 
@@ -148,30 +128,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream.close()
             return
 
-        # اگر 101 بود، رله دوطرفه
-        if b"101" in response.split(b"\r\n")[0]:
-            # سوکت خام کلاینت را بگیر
-            client_sock = self.connection
-            # جلوگیری از بستن خودکار توسط HTTPServer
+        # اگر 101 Switching Protocols بود، رله خام دوطرفه
+        first_line = response.split(b"\r\n", 1)[0]
+        if b" 101 " in first_line:
             self.close_connection = True
+            client_sock = self.connection
             relay(client_sock, upstream)
         else:
             upstream.close()
+            self.close_connection = True
 
-    # ---- پروکسی معمولی HTTP ----
+    # ---------- پروکسی HTTP معمولی به Xray ----------
     def proxy_to_xray_http(self):
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(content_length) if content_length else b""
 
-        request_line = f"{self.command} {self.path} {self.request_version}\r\n"
-        headers = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
-        raw_request = (request_line + headers + "\r\n").encode() + body
+        lines = [f"{self.command} {self.path} {self.request_version}"]
+        for k, v in self.headers.items():
+            lines.append(f"{k}: {v}")
+        raw_request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", "ignore") + body
 
         try:
             upstream = socket.create_connection(("127.0.0.1", XRAY_PORT), timeout=10)
             upstream.sendall(raw_request)
 
-            # خواندن پاسخ
             response = b""
             upstream.settimeout(30)
             while True:
@@ -184,13 +164,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 response += chunk
             upstream.close()
 
-            # ارسال به کلاینت
             self.wfile.write(response)
             self.wfile.flush()
         except Exception as e:
-            self.send_error(502, f"Bad Gateway: {e}")
+            try:
+                self.send_error(502, f"Bad Gateway: {e}")
+            except Exception:
+                pass
 
-    # ---- صفحه پنل ----
+    # ---------- صفحه پنل ----------
     def serve_panel(self):
         vless_tls = (
             f"vless://{UUID}@{DOMAIN}:443"
@@ -198,7 +180,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             f"&type=ws&host={DOMAIN}&path={WSPATH}#SpinPanel-TLS"
         )
         vless_notls = (
-            f"vless://{UUID}@{DOMAIN}:80"
+            f"vless://{UUID}@{DOMAIN}:8080"
             f"?encryption=none&security=none"
             f"&type=ws&host={DOMAIN}&path={WSPATH}#SpinPanel-NonTLS"
         )
@@ -232,21 +214,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
   <div class="card"><span class="label">WS Path:</span><div class="value">{WSPATH}</div></div>
 
   <div class="card">
-    <span class="label">VLESS WS TLS:</span>
+    <span class="label">VLESS WS TLS (پورت 443):</span>
     <textarea readonly onclick="this.select()">{vless_tls}</textarea>
     <button class="copy-btn" onclick="copyText(this)">کپی</button>
   </div>
 
   <div class="card">
-    <span class="label">VLESS WS Non-TLS:</span>
+    <span class="label">VLESS WS Non-TLS (پورت 8080):</span>
     <textarea readonly onclick="this.select()">{vless_notls}</textarea>
     <button class="copy-btn" onclick="copyText(this)">کپی</button>
   </div>
 </div>
 <script>
 function copyText(btn){{
-  const t=btn.previousElementSibling;t.select();document.execCommand('copy');
-  btn.textContent='✓ کپی شد';setTimeout(()=>btn.textContent='کپی',1500);
+  const t=btn.previousElementSibling;
+  t.select();document.execCommand('copy');
+  btn.textContent='✓ کپی شد';
+  setTimeout(()=>btn.textContent='کپی',1500);
 }}
 </script>
 </body>
@@ -259,46 +243,34 @@ function copyText(btn){{
         self.end_headers()
         self.wfile.write(data)
 
-    # ---- مسیریابی ----
-    def do_GET(self):
+    # ---------- مسیریابی ----------
+    def route(self):
         path = urlparse(self.path).path
 
-        if path == WSPATH or path.startswith(WSPATH + "?"):
+        # مسیر WebSocket
+        if path == WSPATH or path.startswith(WSPATH + "?") or path.startswith(WSPATH + "/"):
             if self.is_websocket():
-                self.proxy_to_xray()
+                self.proxy_to_xray_ws()
             else:
                 self.proxy_to_xray_http()
-        elif path == "/" or path == "/index.html":
+        # صفحه پنل
+        elif path in ("/", "/index.html"):
             self.serve_panel()
+        # سایر مسیرها
         else:
             self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Not Found")
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        if path == WSPATH or path.startswith(WSPATH + "?"):
-            if self.is_websocket():
-                self.proxy_to_xray()
-            else:
-                self.proxy_to_xray_http()
-        else:
-            self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_PUT(self):
-        self.do_POST()
-
-    def do_DELETE(self):
-        self.do_POST()
+    def do_GET(self):    self.route()
+    def do_POST(self):   self.route()
+    def do_HEAD(self):   self.route()
+    def do_PUT(self):    self.route()
+    def do_DELETE(self): self.route()
 
 
 # ============================================
-# ThreadingHTTPServer
+# سرور با Threading
 # ============================================
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
@@ -307,13 +279,12 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     server = ThreadingHTTPServer(("0.0.0.0", APP_PORT), ProxyHandler)
-    print(f"[+] SpinPanel listening on 0.0.0.0:{APP_PORT}")
-    print(f"[+] WebSocket path: {WSPATH} -> 127.0.0.1:{XRAY_PORT}")
-    print(f"[+] Panel path: / -> panel")
+    print(f"[+] SpinPanel listening on 0.0.0.0:{APP_PORT}", flush=True)
+    print(f"[+] WebSocket: {WSPATH} -> 127.0.0.1:{XRAY_PORT}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[!] Shutting down...")
+        print("\n[!] Shutting down...", flush=True)
         server.shutdown()
 
 
