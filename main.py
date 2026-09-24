@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-SpinPanel - Python Edition (Transparent WebSocket Proxy)
-پروکسی شفاف TCP برای Xray VLESS WS + پنل وب
+SpinPanel - Transparent WebSocket Proxy for Xray VLESS WS
+- تمام درخواست‌های WebSocket را شفاف به Xray رله می‌کند
+- صفحه پنل را روی / نشان می‌دهد
+- لاگ کامل در Railway Deploy Logs
 """
 
 import os
@@ -10,6 +12,8 @@ import socket
 import select
 import threading
 import socketserver
+import datetime
+import json
 
 # ============================================
 # تنظیمات
@@ -20,47 +24,64 @@ UUID      = os.environ.get("UUID", "generated-uuid")
 WSPATH    = os.environ.get("WSPATH", "/ws")
 DOMAIN    = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")
 
-# اطمینان از اینکه WSPATH با / شروع می‌شود
 if not WSPATH.startswith("/"):
     WSPATH = "/" + WSPATH
+if WSPATH.endswith("/") and len(WSPATH) > 1:
+    WSPATH = WSPATH.rstrip("/")
 
-print(f"[Config] APP_PORT={APP_PORT}", flush=True)
-print(f"[Config] XRAY_PORT={XRAY_PORT}", flush=True)
-print(f"[Config] UUID={UUID}", flush=True)
-print(f"[Config] WSPATH={WSPATH}", flush=True)
-print(f"[Config] DOMAIN={DOMAIN}", flush=True)
+
+def log(tag, msg):
+    """لاگ با timestamp به stdout که Railway می‌بیند"""
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{tag}] {msg}"
+    print(line, flush=True)
+
+
+log("BOOT", f"APP_PORT={APP_PORT}")
+log("BOOT", f"XRAY_PORT={XRAY_PORT}")
+log("BOOT", f"UUID={UUID}")
+log("BOOT", f"WSPATH={WSPATH}")
+log("BOOT", f"DOMAIN={DOMAIN}")
 
 
 # ============================================
 # رله دوطرفه TCP
 # ============================================
-def relay(a, b):
+def relay(a, b, tag="RELAY"):
+    """انتقال دوطرفه داده بین دو سوکت تا بسته شدن یکی"""
     socks = [a, b]
+    total = 0
     try:
         while True:
-            r, _, _ = select.select(socks, [], [], 600)
+            r, _, _ = select.select(socks, [], [], 300)
             if not r:
+                log(tag, "idle timeout, closing")
                 break
             for s in r:
                 try:
                     data = s.recv(65536)
-                except Exception:
+                except Exception as e:
+                    log(tag, f"recv error: {e}")
                     return
                 if not data:
+                    log(tag, "peer closed")
                     return
+                total += len(data)
                 other = b if s is a else a
                 try:
                     other.sendall(data)
-                except Exception:
+                except Exception as e:
+                    log(tag, f"send error: {e}")
                     return
     finally:
         for s in (a, b):
             try: s.close()
             except Exception: pass
+        log(tag, f"closed, total bytes relayed: {total}")
 
 
 # ============================================
-# ساخت صفحه پنل
+# صفحه پنل
 # ============================================
 def build_panel():
     vless_tls = (
@@ -73,7 +94,7 @@ def build_panel():
         f"?encryption=none&security=none"
         f"&type=ws&host={DOMAIN}&path={WSPATH}#SpinPanel-NonTLS"
     )
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -120,113 +141,127 @@ function copyText(btn){{
 </script>
 </body>
 </html>"""
-    return html.encode("utf-8")
 
 
-PANEL_HTML = build_panel()
-PANEL_BYTES = PANEL_HTML
+PANEL_HTML = build_panel().encode("utf-8")
 
 
 # ============================================
-# هندلر TCP خام
+# هندلر اصلی TCP
 # ============================================
-class RawHandler(socketserver.BaseRequestHandler):
+class Handler(socketserver.BaseRequestHandler):
+
     def handle(self):
+        peer = self.client_address
         client = self.request
-        client.settimeout(10)
+        client.settimeout(15)
 
-        # خواندن اولین بخش داده (تا 8 کیلوبایت)
+        # خواندن اولین تکه داده
         try:
-            first_chunk = client.recv(8192)
+            first = client.recv(16384)
+        except Exception as e:
+            log("HTTP", f"{peer} recv fail: {e}")
+            client.close(); return
+
+        if not first:
+            log("HTTP", f"{peer} empty request")
+            client.close(); return
+
+        # پارس کردن خط اول درخواست
+        try:
+            first_line = first.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+            parts = first_line.split(" ")
+            method = parts[0] if len(parts) > 0 else "?"
+            path   = parts[1] if len(parts) > 1 else "/"
         except Exception:
-            client.close()
-            return
+            method, path = "?", "/"
 
-        if not first_chunk:
-            client.close()
-            return
+        # تشخیص WebSocket
+        head_lower = first.lower()
+        is_ws = (b"upgrade: websocket" in head_lower) and (b"connection: upgrade" in head_lower)
 
-        # تشخیص WebSocket با بررسی هدر Upgrade
-        first_line = first_chunk.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
-        lower = first_chunk.lower()
+        log("HTTP", f"{peer} {method} {path} WS={is_ws}")
 
-        is_ws = (b"upgrade: websocket" in lower) or (b"upgrade:websocket" in lower)
-
-        if is_ws:
-            # رله شفاف به Xray
+        # ============ WebSocket → Xray ============
+        if is_ws and (path == WSPATH or path.startswith(WSPATH)):
+            log("WS", f"{peer} forwarding to Xray 127.0.0.1:{XRAY_PORT}")
             try:
                 upstream = socket.create_connection(("127.0.0.1", XRAY_PORT), timeout=10)
             except Exception as e:
-                print(f"[WS] Cannot connect to Xray: {e}", flush=True)
+                log("WS", f"{peer} cannot connect to Xray: {e}")
                 try:
                     client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 except Exception:
                     pass
-                client.close()
-                return
+                client.close(); return
 
+            # ارسال کل داده اولیه به Xray
             try:
-                upstream.sendall(first_chunk)
-            except Exception:
-                upstream.close()
-                client.close()
-                return
+                upstream.sendall(first)
+            except Exception as e:
+                log("WS", f"{peer} send to Xray fail: {e}")
+                upstream.close(); client.close(); return
 
             client.settimeout(None)
             upstream.settimeout(None)
-            relay(client, upstream)
+            relay(client, upstream, tag=f"WS-{peer[0]}")
             return
 
-        # HTTP معمولی: صفحه پنل
-        path = "/"
-        try:
-            parts = first_line.split(" ")
-            if len(parts) >= 2:
-                path = parts[1]
-        except Exception:
-            pass
+        # ============ HTTP معمولی → پنل ============
+        if path in ("/", "/index.html"):
+            log("HTTP", f"{peer} serving panel")
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(PANEL_HTML)).encode() + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            ) + PANEL_HTML
+        else:
+            log("HTTP", f"{peer} 404 on {path}")
+            body = b"Not Found"
+            resp = (
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            ) + body
 
         try:
-            if path in ("/", "/index.html"):
-                resp = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/html; charset=utf-8\r\n"
-                    b"Content-Length: " + str(len(PANEL_BYTES)).encode() + b"\r\n"
-                    b"Connection: close\r\n\r\n"
-                ) + PANEL_BYTES
-            else:
-                resp = (
-                    b"HTTP/1.1 404 Not Found\r\n"
-                    b"Content-Type: text/plain\r\n"
-                    b"Content-Length: 9\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b"Not Found"
-                )
             client.sendall(resp)
-        except Exception:
-            pass
+        except Exception as e:
+            log("HTTP", f"{peer} send resp fail: {e}")
         finally:
             try: client.close()
             except Exception: pass
 
 
 # ============================================
-# سرور
+# سرور Threaded
 # ============================================
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 100
 
 
 def main():
-    server = ThreadedTCPServer(("0.0.0.0", APP_PORT), RawHandler)
-    print(f"[+] SpinPanel listening on 0.0.0.0:{APP_PORT}", flush=True)
-    print(f"[+] WebSocket path: {WSPATH}", flush=True)
-    print(f"[+] Xray upstream: 127.0.0.1:{XRAY_PORT}", flush=True)
+    try:
+        server = ThreadedTCPServer(("0.0.0.0", APP_PORT), Handler)
+    except Exception as e:
+        log("BOOT", f"Cannot bind {APP_PORT}: {e}")
+        sys.exit(1)
+
+    log("BOOT", f"SpinPanel listening on 0.0.0.0:{APP_PORT}")
+    log("BOOT", f"WebSocket path: {WSPATH}")
+    log("BOOT", f"Xray upstream: 127.0.0.1:{XRAY_PORT}")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[!] Shutting down...", flush=True)
+        log("BOOT", "Shutting down...")
+        server.shutdown()
 
 
 if __name__ == "__main__":
