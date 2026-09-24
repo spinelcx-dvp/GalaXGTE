@@ -7,7 +7,6 @@ const DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_U
 const PANEL_PORT = process.env.PANEL_PORT || 3000;
 
 const server = http.createServer((req, res) => {
-  // صفحه اصلی پنل
   if (req.url === '/' || req.url === '/index.html') {
     const vlessTLS = `vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=${encodeURIComponent(WSPATH)}#SpinPanel-TLS`;
     const vlessNoTLS = `vless://${UUID}@${DOMAIN}:80?encryption=none&security=none&type=ws&host=${DOMAIN}&path=${encodeURIComponent(WSPATH)}#SpinPanel-NonTLS`;
